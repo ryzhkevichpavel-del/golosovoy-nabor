@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
+import math
 import os
 import queue
 import threading
@@ -80,6 +81,7 @@ class NativeFloatButton:
     WM_CLOSE = 0x0010
     WM_DESTROY = 0x0002
     WM_SETCURSOR = 0x0020
+    WM_TIMER = 0x0113
     WM_LBUTTONDOWN = 0x0201
     WM_LBUTTONUP = 0x0202
     WM_MOUSEMOVE = 0x0200
@@ -111,6 +113,8 @@ class NativeFloatButton:
     BI_RGB = 0
     DIB_RGB_COLORS = 0
     IDC_HAND = 32649
+    ANIMATION_TIMER_ID = 1042
+    ANIMATION_FRAME_MS = 16
 
     def __init__(
         self,
@@ -139,6 +143,8 @@ class NativeFloatButton:
         self._captured = False
         self._hovered = False
         self._tracking_mouse = False
+        self._timer_active = False
+        self._elapsed_anchor = time.monotonic()
         self._last_tick = 0
         self._configure_win32_api()
 
@@ -222,6 +228,10 @@ class NativeFloatButton:
         user32.SetCursor.restype = ctypes.wintypes.HANDLE
         user32.TrackMouseEvent.argtypes = [ctypes.POINTER(TRACKMOUSEEVENT)]
         user32.TrackMouseEvent.restype = ctypes.wintypes.BOOL
+        user32.SetTimer.argtypes = [ctypes.wintypes.HWND, ctypes.c_size_t, ctypes.wintypes.UINT, ctypes.c_void_p]
+        user32.SetTimer.restype = ctypes.c_size_t
+        user32.KillTimer.argtypes = [ctypes.wintypes.HWND, ctypes.c_size_t]
+        user32.KillTimer.restype = ctypes.wintypes.BOOL
         user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
         user32.GetCursorPos.restype = ctypes.wintypes.BOOL
         user32.GetDC.argtypes = [ctypes.wintypes.HWND]
@@ -345,6 +355,12 @@ class NativeFloatButton:
         if msg == self.WM_SETCURSOR:
             user32.SetCursor(user32.LoadCursorW(None, ctypes.c_void_p(self.IDC_HAND)))
             return 1
+        if msg == self.WM_TIMER and int(wparam) == self.ANIMATION_TIMER_ID:
+            if self._should_animate():
+                self._redraw()
+            else:
+                self._sync_animation_timer()
+            return 0
         if msg == self.WM_NCHITTEST:
             return self.HTCLIENT
         if msg == self.WM_LBUTTONDOWN:
@@ -419,10 +435,12 @@ class NativeFloatButton:
             if action == "state" and isinstance(payload, tuple):
                 self.state = str(payload[0])
                 self.elapsed = float(payload[1])
+                self._elapsed_anchor = time.monotonic() - self.elapsed
                 changed = True
             elif action == "visible":
                 self.visible = bool(payload)
                 ctypes.windll.user32.ShowWindow(self.hwnd, self.SW_SHOWNA if self.visible else self.SW_HIDE)
+                self._sync_animation_timer()
             elif action == "move" and isinstance(payload, tuple):
                 self.x = int(payload[0])
                 self.y = int(payload[1])
@@ -436,6 +454,7 @@ class NativeFloatButton:
                     self.SWP_NOSIZE | self.SWP_NOACTIVATE,
                 )
         if changed:
+            self._sync_animation_timer()
             self._redraw()
 
     def _redraw(self) -> None:
@@ -485,7 +504,7 @@ class NativeFloatButton:
 
     def _render(self) -> Image.Image:
         state = self.state
-        if state == "recording":
+        if state in {"recording", "arming"}:
             width, height = 144, 68
         else:
             width, height = 106, 68
@@ -540,13 +559,33 @@ class NativeFloatButton:
         body_radius = 24
         hovered = self._hovered and not self._captured
 
-        if state == "recording":
+        if state == "arming":
+            shadow(body, body_radius, 18 if hovered else 14, 5, 3)
+            shadow(body, body_radius, 7 if hovered else 5, 8, 5)
+            rounded_gradient(body, body_radius, "#2f2f2f" if hovered else "#282828", "#111111")
+            draw.rounded_rectangle(box(body), radius=body_radius * scale, outline=rgba("#3e3e3e", 95), width=1 * scale)
+            phase = time.monotonic() * 5.0
+            center_x = width // 2
+            center_y = (body[1] + body[3]) // 2
+            for index in range(3):
+                lift = (math.sin(phase + index * 0.72) + 1) / 2
+                radius = int((4.4 + lift * 2.2) * scale)
+                dot_x = int((center_x - 16 + index * 16) * scale)
+                dot_y = center_y * scale
+                color_alpha = int(118 + lift * 116)
+                draw.ellipse(
+                    (dot_x - radius, dot_y - radius, dot_x + radius, dot_y + radius),
+                    fill=rgba("#ffffff", color_alpha),
+                )
+        elif state == "recording":
             shadow(body, body_radius, 20 if hovered else 16, 5, 3)
             shadow(body, body_radius, 8 if hovered else 6, 8, 5)
             rounded_gradient(body, body_radius, "#303030" if hovered else "#2a2a2a", "#121212")
             draw.rounded_rectangle(box(body), radius=body_radius * scale, outline=rgba("#3f3f3f", 95), width=1 * scale)
             draw.rounded_rectangle(box((35, 26, 47, 38)), radius=3 * scale, fill=rgba("#ffffff", 246))
-            text = _format_elapsed(self.elapsed)
+            pulse = (math.sin(time.monotonic() * 6.0) + 1) / 2
+            draw.ellipse(box((24, 30, 28, 34)), fill=rgba("#4aa3ff", int(130 + pulse * 110)))
+            text = _format_elapsed(self._current_elapsed())
             font = _float_font(20 * scale, bold=False)
             text_box = draw.textbbox((0, 0), text, font=font)
             text_x = 64 * scale
@@ -560,9 +599,30 @@ class NativeFloatButton:
             center_x = width // 2
             center_y = (body[1] + body[3]) // 2
             if state == "processing":
-                draw.ellipse(box((center_x - 12, center_y - 12, center_x + 12, center_y + 12)), outline=rgba("#d7d7d2"), width=4 * scale)
-                start = (int(time.monotonic() * 8) * 24) % 360
-                draw.arc(box((center_x - 12, center_y - 12, center_x + 12, center_y + 12)), start=start, end=start + 112, fill=rgba("#202020"), width=4 * scale)
+                ring_box = box((center_x - 14, center_y - 14, center_x + 14, center_y + 14))
+                draw.ellipse(ring_box, outline=rgba("#dcdcd6"), width=3 * scale)
+                phase = (time.monotonic() * 265.0) % 360
+                for index in range(8):
+                    alpha = max(0, 210 - index * 24)
+                    start = phase - index * 10
+                    draw.arc(
+                        ring_box,
+                        start=start,
+                        end=start + 72,
+                        fill=rgba("#111111", alpha),
+                        width=3 * scale,
+                    )
+                pulse = (math.sin(time.monotonic() * 4.0) + 1) / 2
+                dot = int((3.5 + pulse * 1.4) * scale)
+                draw.ellipse(
+                    (
+                        center_x * scale - dot,
+                        center_y * scale - dot,
+                        center_x * scale + dot,
+                        center_y * scale + dot,
+                    ),
+                    fill=rgba("#2f80ff", int(145 + pulse * 65)),
+                )
             elif state == "error":
                 draw.rounded_rectangle(box(body), radius=body_radius * scale, outline=rgba("#f59e0b"), width=2 * scale)
                 draw.ellipse(box((center_x - 5, center_y - 5, center_x + 5, center_y + 5)), fill=rgba("#f59e0b"))
@@ -577,6 +637,25 @@ class NativeFloatButton:
                 )
 
         return image.resize((width, height), Image.Resampling.LANCZOS)
+
+    def _should_animate(self) -> bool:
+        return self.visible and self.state in {"arming", "recording", "processing"}
+
+    def _sync_animation_timer(self) -> None:
+        if not self.hwnd:
+            return
+        user32 = ctypes.windll.user32
+        if self._should_animate() and not self._timer_active:
+            if user32.SetTimer(self.hwnd, self.ANIMATION_TIMER_ID, self.ANIMATION_FRAME_MS, None):
+                self._timer_active = True
+        elif not self._should_animate() and self._timer_active:
+            user32.KillTimer(self.hwnd, self.ANIMATION_TIMER_ID)
+            self._timer_active = False
+
+    def _current_elapsed(self) -> float:
+        if self.state == "recording":
+            return max(0.0, time.monotonic() - self._elapsed_anchor)
+        return max(0.0, self.elapsed)
 
     def _track_mouse_leave(self, hwnd: int) -> None:
         event = TRACKMOUSEEVENT()

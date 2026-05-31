@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
+import logging
 import os
 import queue
 import sys
 import threading
 import time
 import tkinter as tk
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -16,7 +18,7 @@ from PIL import Image, ImageDraw
 from pynput import keyboard
 
 from .audio_recorder import AudioRecorder, list_input_devices
-from .config import APP_NAME, AUDIO_DIR, ensure_app_dirs, load_settings, save_settings
+from .config import APP_NAME, AUDIO_DIR, LOG_DIR, ensure_app_dirs, load_settings, save_settings
 from .history import list_history, save_transcript
 from .insert import paste_text
 from .native_float import NativeFloatButton
@@ -35,7 +37,7 @@ def ensure_single_instance() -> None:
     user32 = ctypes.windll.user32
     _MUTEX_HANDLE = kernel32.CreateMutexW(None, True, "Local\\GolosovoyNaborSingleInstance")
     if kernel32.GetLastError() == 183:
-        user32.MessageBoxW(None, "Глас уже запущен возле часов.", APP_NAME, 0x40)
+        user32.MessageBoxW(None, "Voxa уже запущена возле часов.", APP_NAME, 0x40)
         sys.exit(0)
 
 
@@ -88,6 +90,7 @@ class VoiceTypingApp:
     def __init__(self) -> None:
         self.settings = load_settings()
         ensure_app_dirs(self.settings)
+        self.logger = self._configure_logging()
         self.settings.run_on_startup = is_run_on_startup()
         save_settings(self.settings)
 
@@ -98,6 +101,7 @@ class VoiceTypingApp:
 
         self.status_var = tk.StringVar(value="Готово")
         self.recorder: AudioRecorder | None = None
+        self.is_arming = False
         self.is_recording = False
         self.is_busy = False
         self.tray_icon: pystray.Icon | None = None
@@ -113,15 +117,27 @@ class VoiceTypingApp:
         self.transcriber: FasterWhisperTranscriber | WhisperCppTranscriber | None = None
         self.transcriber_lock = threading.Lock()
         self.last_toggle_at = 0.0
+        self.logger.info("app_started provider=%s model=%s language=%s", self.settings.provider, self.settings.model_name, self.settings.language)
 
     def run(self) -> None:
         self._build_status_window()
         self._start_tray()
         self._start_hotkey()
-        self.root.after(150, self._drain_ui_queue)
-        self.root.after(250, self._tick)
+        self.root.after(50, self._drain_ui_queue)
+        self.root.after(100, self._tick)
         self.root.after(800, self._warm_up_transcriber)
         self.root.mainloop()
+
+    @staticmethod
+    def _configure_logging() -> logging.Logger:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger("voxa")
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            handler = RotatingFileHandler(LOG_DIR / "voxa.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(handler)
+        return logger
 
     def _start_tray(self) -> None:
         image = self._make_icon("idle")
@@ -133,7 +149,7 @@ class VoiceTypingApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", lambda icon, item: self._post("quit")),
         )
-        self.tray_icon = pystray.Icon("golosovoy-nabor", image, APP_NAME, menu)
+        self.tray_icon = pystray.Icon("voxa", image, APP_NAME, menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def _start_hotkey(self) -> None:
@@ -161,11 +177,14 @@ class VoiceTypingApp:
                 with self.transcriber_lock:
                     if not isinstance(self.transcriber, FasterWhisperTranscriber):
                         self._post("status", "Готовлюсь")
+                        self.logger.info("transcriber_warmup_start model=%s", self.settings.model_name)
                         transcriber = FasterWhisperTranscriber(self.settings)
                         transcriber.warm_up()
                         self.transcriber = transcriber
+                        self.logger.info("transcriber_warmup_done model=%s", self.settings.model_name)
                 self._post("status", "Готово")
-            except Exception:
+            except Exception as exc:
+                self.logger.exception("transcriber_warmup_failed: %s", exc)
                 self._post("status", "Готово")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -197,7 +216,7 @@ class VoiceTypingApp:
                 self._show_error(str(payload))
             elif action == "done":
                 self._after_transcription(payload)
-        self.root.after(150, self._drain_ui_queue)
+        self.root.after(50, self._drain_ui_queue)
 
     def toggle_recording(self) -> None:
         now = time.monotonic()
@@ -213,6 +232,14 @@ class VoiceTypingApp:
             self.start_recording()
 
     def start_recording(self) -> None:
+        self.logger.info("recording_start_requested")
+        self.is_arming = True
+        self.float_feedback = None
+        self._set_status("Готовлю запись")
+        self._set_tray_icon("recording")
+        self._show_status_window()
+        if self.status_window:
+            self.status_window.set_state("arming", 0.0)
         try:
             self.recorder = AudioRecorder(
                 audio_dir=AUDIO_DIR,
@@ -221,33 +248,43 @@ class VoiceTypingApp:
             )
             self.recorder.start()
         except Exception as exc:
+            self.is_arming = False
             self.recorder = None
+            self.logger.exception("recording_start_failed: %s", exc)
             self._show_error(f"Не удалось начать запись: {exc}")
             return
 
+        self.is_arming = False
         self.is_recording = True
         self.recording_started_at = time.monotonic()
         self.recognition_started_at = None
-        self.float_feedback = None
         self._set_status("Идёт запись")
         self._set_tray_icon("recording")
         self._show_status_window()
+        if self.status_window:
+            self.status_window.set_state("recording", 0.0)
+        self.logger.info("recording_started")
 
     def stop_recording(self) -> None:
+        if self.is_arming:
+            return
         if not self.recorder:
             return
-        if self.recording_started_at is not None and time.monotonic() - self.recording_started_at < 0.7:
+        if self.recording_started_at is not None and time.monotonic() - self.recording_started_at < 0.25:
             self._set_status("Запись только началась.")
             return
         try:
             recording = self.recorder.stop()
         except Exception as exc:
+            self.is_arming = False
             self.is_recording = False
             self.recorder = None
             self._set_tray_icon("idle")
+            self.logger.exception("recording_stop_failed: %s", exc)
             self._show_error(f"Не удалось сохранить звук: {exc}")
             return
 
+        self.is_arming = False
         self.is_recording = False
         self.recorder = None
         self.is_busy = True
@@ -256,28 +293,38 @@ class VoiceTypingApp:
         self.float_feedback = None
         self._set_tray_icon("busy")
         self._set_status("Распознаю")
+        self.logger.info("recording_saved path=%s seconds=%.2f bytes=%s", recording.path, recording.seconds, recording.path.stat().st_size if recording.path.exists() else 0)
         threading.Thread(target=self._transcribe_in_background, args=(recording.path,), daemon=True).start()
 
     def _transcribe_in_background(self, wav_path: Path) -> None:
+        started = time.monotonic()
         try:
+            self.logger.info("transcription_start path=%s", wav_path)
             if self.settings.provider == "faster_whisper":
                 with self.transcriber_lock:
                     if not isinstance(self.transcriber, FasterWhisperTranscriber):
                         self._post("status", "Готовлюсь")
+                        self.logger.info("transcriber_lazy_warmup_start model=%s", self.settings.model_name)
                         self.transcriber = FasterWhisperTranscriber(self.settings)
                         self.transcriber.warm_up()
+                        self.logger.info("transcriber_lazy_warmup_done model=%s", self.settings.model_name)
                     transcriber = self.transcriber
             else:
                 if not backend_ready(self.settings.model_name):
                     ensure_backend(self.settings.model_name, progress=lambda _text: self._post("status", "Готовлюсь"))
                 transcriber = WhisperCppTranscriber(self.settings)
             transcript = transcriber.transcribe(wav_path)
-            self._post("done", transcript.text)
+            elapsed = time.monotonic() - started
+            self.logger.info("transcription_done path=%s seconds=%.2f text_len=%d", wav_path, elapsed, len(transcript.text))
+            self._post("done", {"text": transcript.text, "elapsed": elapsed, "path": str(wav_path)})
         except MissingBackendError as exc:
+            self.logger.exception("transcription_missing_backend path=%s: %s", wav_path, exc)
             self._post("error", str(exc))
         except TranscriptionError as exc:
+            self.logger.exception("transcription_failed path=%s: %s", wav_path, exc)
             self._post("error", str(exc))
         except Exception as exc:
+            self.logger.exception("transcription_unexpected path=%s: %s", wav_path, exc)
             self._post("error", f"Неожиданная ошибка: {exc}")
 
     def _after_transcription(self, payload: object | None) -> None:
@@ -285,8 +332,12 @@ class VoiceTypingApp:
         self.recording_started_at = None
         self.recognition_started_at = None
         self._set_tray_icon("idle")
-        text = str(payload or "").strip()
+        if isinstance(payload, dict):
+            text = str(payload.get("text") or "").strip()
+        else:
+            text = str(payload or "").strip()
         if not text:
+            self.logger.warning("transcription_empty_payload")
             self._set_status("Пустой текст.")
             return
         pasted = paste_text(text, do_paste=self.settings.auto_paste)
@@ -299,6 +350,7 @@ class VoiceTypingApp:
         self.float_feedback = ("success", time.monotonic() + 1.8)
         self._set_status(suffix + ".")
         self._show_status_window(auto_hide=True)
+        self.logger.info("transcription_applied pasted=%s saved=%s text_len=%d", pasted, bool(saved_path), len(text))
 
     def show_float_menu(self) -> None:
         menu = tk.Menu(
@@ -314,7 +366,6 @@ class VoiceTypingApp:
         menu.add_command(label="Настройки", command=self.show_settings)
         menu.add_separator()
         menu.add_command(label="Папка истории", command=self.open_history_folder)
-        menu.add_command(label="Скрыть кнопку", command=self.hide_floating_button)
         menu.add_separator()
         menu.add_command(label="Выход", command=self.quit)
         x, y = self.root.winfo_pointerxy()
@@ -348,7 +399,7 @@ class VoiceTypingApp:
         ttk.Combobox(
             frame,
             textvariable=model_var,
-            values=("base", "tiny", "small", "medium"),
+            values=("base", "tiny"),
             state="readonly",
         ).grid(
             row=1, column=1, sticky="ew", pady=6
@@ -594,11 +645,13 @@ class VoiceTypingApp:
 
     def _show_error(self, text: str) -> None:
         self.is_busy = False
+        self.is_arming = False
         self.is_recording = False
         self.recording_started_at = None
         self.recognition_started_at = None
         self.float_feedback = ("error", time.monotonic() + 5.0)
         self._set_tray_icon("idle")
+        self.logger.error("ui_error: %s", text)
         self._set_status(text)
         self._show_status_window()
 
@@ -623,7 +676,7 @@ class VoiceTypingApp:
 
     def _tick(self) -> None:
         self._refresh_floating()
-        self.root.after(250, self._tick)
+        self.root.after(100, self._tick)
 
     def _refresh_floating(self) -> None:
         if not self.status_window:
@@ -631,6 +684,9 @@ class VoiceTypingApp:
         state = "idle"
         elapsed: float | None = None
         now = time.monotonic()
+        if self.is_arming:
+            self.status_window.set_state("arming", 0.0)
+            return
         if self.is_recording and self.recording_started_at is not None:
             state = "recording"
             elapsed = now - self.recording_started_at

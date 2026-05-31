@@ -26,12 +26,14 @@ class AudioRecorder:
         self._frames: list[np.ndarray] = []
         self._lock = threading.Lock()
         self._started_at: datetime | None = None
+        self._first_frame = threading.Event()
 
     def start(self) -> None:
         if self._stream is not None:
             return
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self._frames = []
+        self._first_frame.clear()
         self._started_at = datetime.now()
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
@@ -41,6 +43,7 @@ class AudioRecorder:
             callback=self._callback,
         )
         self._stream.start()
+        self._first_frame.wait(timeout=0.5)
 
     def stop(self) -> AudioRecording:
         if self._stream is None:
@@ -68,6 +71,7 @@ class AudioRecorder:
         del frames, time_info, status
         with self._lock:
             self._frames.append(indata.copy())
+        self._first_frame.set()
 
 
 def list_input_devices() -> list[tuple[int, str]]:

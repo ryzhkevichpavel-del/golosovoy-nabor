@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 APP_ID = "GolosovoyNabor"
-APP_NAME = "Глас"
-APP_NAME_ASCII = "Glas"
+APP_NAME = "Voxa"
+APP_NAME_ASCII = "Voxa"
 
 
 def _local_app_data() -> Path:
@@ -32,12 +32,12 @@ MODEL_DIR = APP_DIR / "models"
 AUDIO_DIR = APP_DIR / "audio"
 LOG_DIR = APP_DIR / "logs"
 SETTINGS_PATH = APP_DIR / "settings.json"
-DEFAULT_HISTORY_DIR = _documents_dir() / "Глас" / "История"
+DEFAULT_HISTORY_DIR = _documents_dir() / "Voxa" / "History"
 
 
 @dataclass
 class AppSettings:
-    settings_version: int = 5
+    settings_version: int = 6
     provider: str = "faster_whisper"
     hotkey: str = "<f8>"
     language: str = "ru"
@@ -95,6 +95,10 @@ def load_settings() -> AppSettings:
         merged["settings_version"] = defaults["settings_version"]
     if int(raw.get("settings_version", 0) or 0) < 5:
         merged["provider"] = defaults["provider"]
+        merged["model_name"] = "base"
+        merged["settings_version"] = defaults["settings_version"]
+    if int(raw.get("settings_version", 0) or 0) < 6:
+        merged["show_status_window"] = True
         merged["model_name"] = "base"
         merged["settings_version"] = defaults["settings_version"]
     settings = AppSettings(**merged)

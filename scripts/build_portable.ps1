@@ -5,8 +5,8 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
-$ProductName = "Глас"
-$PackageName = "Glas-portable"
+$ProductName = "Voxa"
+$PackageName = "Voxa-portable"
 
 if (!(Test-Path $Python)) {
     py -3.11 -m venv .venv
@@ -61,10 +61,10 @@ pause
 $Bat | Set-Content -Path (Join-Path $PackageDir "Install.bat") -Encoding ASCII
 
 $ReadmeTxt = @"
-Глас
+Voxa
 
-1. Не вытаскивайте "Глас.exe" отдельно: рядом нужна папка "_internal".
-2. Запустите "Install.bat" для установки или "Глас.exe" как переносимую версию.
+1. Не вытаскивайте "Voxa.exe" отдельно: рядом нужна папка "_internal".
+2. Запустите "Install.bat" для установки или "Voxa.exe" как переносимую версию.
 3. Маленькая кнопка появится на экране, иконка - возле часов.
 4. Горячая клавиша: F8.
 5. Первый запуск может подготовить бесплатную локальную модель.
