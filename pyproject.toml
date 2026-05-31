@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "golosovoy-nabor"
+version = "0.1.0"
+description = "Free local Windows voice typing app powered by whisper.cpp."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Pavel Ryzhkevich" }]
+dependencies = [
+  "numpy>=1.26,<3",
+  "pillow>=10,<13",
+  "pynput>=1.7,<2",
+  "pyperclip>=1.8,<2",
+  "pystray>=0.19,<1",
+  "sounddevice>=0.4,<1",
+]
+
+[project.scripts]
+golosovoy-nabor = "golosovoy_nabor.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
