@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "golosovoy-nabor"
-version = "0.1.0"
-description = "Free local Windows voice typing app powered by whisper.cpp."
+version = "0.1.1"
+description = "Free local Windows voice typing app powered by Faster Whisper."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Pavel Ryzhkevich" }]
 dependencies = [
+  "faster-whisper>=1.2,<2",
   "numpy>=1.26,<3",
   "pillow>=10,<13",
   "pynput>=1.7,<2",

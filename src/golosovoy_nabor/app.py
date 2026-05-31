@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes
 import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 from pynput import keyboard
 
 from .audio_recorder import AudioRecorder, list_input_devices
@@ -18,7 +20,7 @@ from .config import APP_NAME, AUDIO_DIR, ensure_app_dirs, load_settings, save_se
 from .history import list_history, save_transcript
 from .insert import paste_text
 from .startup import current_executable, is_run_on_startup, set_run_on_startup
-from .transcribers import MissingBackendError, TranscriptionError, WhisperCppTranscriber
+from .transcribers import FasterWhisperTranscriber, MissingBackendError, TranscriptionError, WhisperCppTranscriber
 from .whisper_assets import backend_ready, ensure_backend
 
 _MUTEX_HANDLE: int | None = None
@@ -34,6 +36,51 @@ def ensure_single_instance() -> None:
     if kernel32.GetLastError() == 183:
         user32.MessageBoxW(None, "Голосовой набор уже запущен возле часов.", APP_NAME, 0x40)
         sys.exit(0)
+
+
+class NativeF8Hotkey:
+    _HOTKEY_ID = 0x4708
+    _MOD_NOREPEAT = 0x4000
+    _VK_F8 = 0x77
+    _WM_HOTKEY = 0x0312
+    _WM_QUIT = 0x0012
+
+    def __init__(self, callback) -> None:  # noqa: ANN001
+        self.callback = callback
+        self.thread: threading.Thread | None = None
+        self.thread_id = 0
+        self.ready = threading.Event()
+        self.error: Exception | None = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        self.ready.wait(timeout=2)
+        if self.error:
+            raise self.error
+
+    def stop(self) -> None:
+        if self.thread_id:
+            ctypes.windll.user32.PostThreadMessageW(self.thread_id, self._WM_QUIT, 0, 0)
+        if self.thread:
+            self.thread.join(timeout=1)
+
+    def _run(self) -> None:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        self.thread_id = kernel32.GetCurrentThreadId()
+        if not user32.RegisterHotKey(None, self._HOTKEY_ID, self._MOD_NOREPEAT, self._VK_F8):
+            self.error = OSError("F8 уже занята другой программой.")
+            self.ready.set()
+            return
+        self.ready.set()
+        msg = ctypes.wintypes.MSG()
+        try:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message == self._WM_HOTKEY:
+                    self.callback()
+        finally:
+            user32.UnregisterHotKey(None, self._HOTKEY_ID)
 
 
 class VoiceTypingApp:
@@ -53,36 +100,54 @@ class VoiceTypingApp:
         self.is_recording = False
         self.is_busy = False
         self.tray_icon: pystray.Icon | None = None
-        self.hotkey_listener: keyboard.GlobalHotKeys | None = None
+        self.hotkey_listener: object | None = None
         self.ui_queue: queue.Queue[tuple[str, object | None]] = queue.Queue()
         self.status_window: tk.Toplevel | None = None
         self.settings_window: tk.Toplevel | None = None
         self.history_window: tk.Toplevel | None = None
         self.device_options: list[tuple[int, str]] = []
+        self.float_state = "idle"
+        self.float_canvas: tk.Canvas | None = None
+        self.float_photo: ImageTk.PhotoImage | None = None
+        self.float_feedback: tuple[str, float] | None = None
+        self.recording_started_at: float | None = None
+        self.recognition_started_at: float | None = None
+        self.transcriber: FasterWhisperTranscriber | WhisperCppTranscriber | None = None
+        self.transcriber_lock = threading.Lock()
+        self.last_toggle_at = 0.0
+        self._drag_start: tuple[int, int, int, int] | None = None
+        self._drag_moved = False
+        self._float_width = 104
+        self._float_height = 52
 
     def run(self) -> None:
         self._build_status_window()
         self._start_tray()
         self._start_hotkey()
         self.root.after(150, self._drain_ui_queue)
+        self.root.after(250, self._tick)
+        self.root.after(700, self._warm_up_transcriber)
         self.root.mainloop()
 
     def _start_tray(self) -> None:
         image = self._make_icon("idle")
         menu = pystray.Menu(
-            pystray.MenuItem("Начать / остановить запись", lambda: self._post("toggle")),
-            pystray.MenuItem("История", lambda: self._post("history")),
-            pystray.MenuItem("Настройки", lambda: self._post("settings")),
-            pystray.MenuItem("Открыть папку истории", lambda: self._post("open_history_folder")),
+            pystray.MenuItem("Начать / остановить запись", lambda icon, item: self._post("toggle"), default=True),
+            pystray.MenuItem("История", lambda icon, item: self._post("history")),
+            pystray.MenuItem("Настройки", lambda icon, item: self._post("settings")),
+            pystray.MenuItem("Открыть папку истории", lambda icon, item: self._post("open_history_folder")),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Выход", lambda: self._post("quit")),
+            pystray.MenuItem("Выход", lambda icon, item: self._post("quit")),
         )
         self.tray_icon = pystray.Icon("golosovoy-nabor", image, APP_NAME, menu)
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def _start_hotkey(self) -> None:
         try:
-            self.hotkey_listener = keyboard.GlobalHotKeys({self.settings.hotkey: lambda: self._post("toggle")})
+            if os.name == "nt" and self.settings.hotkey.strip().lower() == "<f8>":
+                self.hotkey_listener = NativeF8Hotkey(lambda: self._post("toggle"))
+            else:
+                self.hotkey_listener = keyboard.GlobalHotKeys({self.settings.hotkey: lambda: self._post("toggle")})
             self.hotkey_listener.start()
         except Exception as exc:
             self._set_status(f"Горячая клавиша не включилась: {exc}")
@@ -92,6 +157,24 @@ class VoiceTypingApp:
             self.hotkey_listener.stop()
             self.hotkey_listener = None
         self._start_hotkey()
+
+    def _warm_up_transcriber(self) -> None:
+        if self.settings.provider != "faster_whisper":
+            return
+
+        def worker() -> None:
+            try:
+                with self.transcriber_lock:
+                    if not isinstance(self.transcriber, FasterWhisperTranscriber):
+                        self._post("status", "Готовлюсь")
+                        transcriber = FasterWhisperTranscriber(self.settings)
+                        transcriber.warm_up()
+                        self.transcriber = transcriber
+                self._post("status", "Готово")
+            except Exception:
+                self._post("status", "Готово")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _post(self, action: str, payload: object | None = None) -> None:
         self.ui_queue.put((action, payload))
@@ -121,6 +204,10 @@ class VoiceTypingApp:
         self.root.after(150, self._drain_ui_queue)
 
     def toggle_recording(self) -> None:
+        now = time.monotonic()
+        if now - self.last_toggle_at < 0.45:
+            return
+        self.last_toggle_at = now
         if self.is_busy:
             self._set_status("Подожди, я ещё распознаю прошлую запись.")
             return
@@ -143,12 +230,18 @@ class VoiceTypingApp:
             return
 
         self.is_recording = True
-        self._set_status("Идёт запись. Нажми горячую клавишу ещё раз, чтобы остановить.")
+        self.recording_started_at = time.monotonic()
+        self.recognition_started_at = None
+        self.float_feedback = None
+        self._set_status("Идёт запись")
         self._set_tray_icon("recording")
         self._show_status_window()
 
     def stop_recording(self) -> None:
         if not self.recorder:
+            return
+        if self.recording_started_at is not None and time.monotonic() - self.recording_started_at < 0.7:
+            self._set_status("Запись только началась.")
             return
         try:
             recording = self.recorder.stop()
@@ -162,15 +255,26 @@ class VoiceTypingApp:
         self.is_recording = False
         self.recorder = None
         self.is_busy = True
+        self.recording_started_at = None
+        self.recognition_started_at = time.monotonic()
+        self.float_feedback = None
         self._set_tray_icon("busy")
-        self._set_status("Распознаю запись...")
+        self._set_status("Распознаю")
         threading.Thread(target=self._transcribe_in_background, args=(recording.path,), daemon=True).start()
 
     def _transcribe_in_background(self, wav_path: Path) -> None:
         try:
-            if not backend_ready(self.settings.model_name):
-                ensure_backend(self.settings.model_name, progress=lambda text: self._post("status", text))
-            transcriber = WhisperCppTranscriber(self.settings)
+            if self.settings.provider == "faster_whisper":
+                with self.transcriber_lock:
+                    if not isinstance(self.transcriber, FasterWhisperTranscriber):
+                        self._post("status", "Готовлюсь")
+                        self.transcriber = FasterWhisperTranscriber(self.settings)
+                        self.transcriber.warm_up()
+                    transcriber = self.transcriber
+            else:
+                if not backend_ready(self.settings.model_name):
+                    ensure_backend(self.settings.model_name, progress=lambda _text: self._post("status", "Готовлюсь"))
+                transcriber = WhisperCppTranscriber(self.settings)
             transcript = transcriber.transcribe(wav_path)
             self._post("done", transcript.text)
         except MissingBackendError as exc:
@@ -182,6 +286,8 @@ class VoiceTypingApp:
 
     def _after_transcription(self, payload: object | None) -> None:
         self.is_busy = False
+        self.recording_started_at = None
+        self.recognition_started_at = None
         self._set_tray_icon("idle")
         text = str(payload or "").strip()
         if not text:
@@ -194,6 +300,7 @@ class VoiceTypingApp:
         suffix = "Текст вставлен" if pasted else "Текст скопирован"
         if saved_path:
             suffix += " и сохранён в историю"
+        self.float_feedback = ("success", time.monotonic() + 1.8)
         self._set_status(suffix + ".")
         self._show_status_window(auto_hide=True)
 
@@ -219,7 +326,12 @@ class VoiceTypingApp:
 
         ttk.Label(frame, text="Модель").grid(row=1, column=0, sticky="w", pady=6)
         model_var = tk.StringVar(value=self.settings.model_name)
-        ttk.Combobox(frame, textvariable=model_var, values=("base", "small", "medium"), state="readonly").grid(
+        ttk.Combobox(
+            frame,
+            textvariable=model_var,
+            values=("base", "tiny", "small", "medium"),
+            state="readonly",
+        ).grid(
             row=1, column=1, sticky="ew", pady=6
         )
 
@@ -258,13 +370,18 @@ class VoiceTypingApp:
             row=6, column=0, columnspan=2, sticky="w", pady=6
         )
 
+        floating_var = tk.BooleanVar(value=self.settings.show_status_window)
+        ttk.Checkbutton(frame, text="Показывать маленькую кнопку на экране", variable=floating_var).grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=6
+        )
+
         status_label = ttk.Label(frame, textvariable=self.status_var, foreground="#555555")
-        status_label.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 6))
+        status_label.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 6))
 
         button_bar = ttk.Frame(frame)
-        button_bar.grid(row=8, column=0, columnspan=2, sticky="ew", pady=6)
+        button_bar.grid(row=9, column=0, columnspan=2, sticky="ew", pady=6)
         button_bar.columnconfigure((0, 1, 2), weight=1)
-        ttk.Button(button_bar, text="Скачать Whisper", command=lambda: self._download_backend(model_var.get())).grid(
+        ttk.Button(button_bar, text="Подготовить модель", command=lambda: self._download_backend(model_var.get())).grid(
             row=0, column=0, sticky="ew", padx=4
         )
         ttk.Button(button_bar, text="Открыть историю", command=self.open_history_folder).grid(
@@ -278,14 +395,15 @@ class VoiceTypingApp:
             paste_var.get(),
             history_var.get(),
             startup_var.get(),
+            floating_var.get(),
         )).grid(row=0, column=2, sticky="ew", padx=4)
 
         help_text = (
-            "Бесплатный режим работает локально через Whisper. "
-            "Будущий режим OpenAI уже заложен в настройках, но сейчас выключен."
+            "Бесплатный режим работает на компьютере. "
+            "Платный режим OpenAI можно будет добавить позже."
         )
         ttk.Label(frame, text=help_text, wraplength=560, foreground="#666666").grid(
-            row=9, column=0, columnspan=2, sticky="ew", pady=(20, 0)
+            row=10, column=0, columnspan=2, sticky="ew", pady=(20, 0)
         )
 
     def _save_settings_from_ui(
@@ -297,13 +415,15 @@ class VoiceTypingApp:
         auto_paste: bool,
         save_history_flag: bool,
         startup: bool,
+        show_floating: bool,
     ) -> None:
-        self.settings.hotkey = hotkey.strip() or "<ctrl>+<alt>+space"
+        self.settings.hotkey = hotkey.strip() or "<f8>"
         self.settings.model_name = model_name
         self.settings.language = language
         self.settings.auto_paste = bool(auto_paste)
         self.settings.save_history = bool(save_history_flag)
         self.settings.run_on_startup = bool(startup)
+        self.settings.show_status_window = bool(show_floating)
         if device_label == "По умолчанию":
             self.settings.device_index = None
         else:
@@ -314,21 +434,33 @@ class VoiceTypingApp:
         save_settings(self.settings)
         set_run_on_startup(self.settings.run_on_startup, current_executable())
         self._restart_hotkey()
+        self.transcriber = None
+        self._warm_up_transcriber()
+        self._show_status_window()
         self._set_status("Настройки сохранены.")
 
     def _download_backend(self, model_name: str) -> None:
         self.is_busy = True
-        self._set_status("Готовлю скачивание...")
+        self.recognition_started_at = time.monotonic()
+        self._set_status("Готовлю модель")
         self._set_tray_icon("busy")
 
         def worker() -> None:
             try:
-                ensure_backend(model_name, progress=lambda text: self._post("status", text))
-                self._post("status", "Whisper готов к работе.")
+                if self.settings.provider == "faster_whisper":
+                    with self.transcriber_lock:
+                        self.settings.model_name = model_name
+                        transcriber = FasterWhisperTranscriber(self.settings)
+                        transcriber.warm_up()
+                        self.transcriber = transcriber
+                else:
+                    ensure_backend(model_name, progress=lambda _text: self._post("status", "Готовлю модель"))
+                self._post("status", "Готово")
             except Exception as exc:
-                self._post("error", f"Не удалось скачать Whisper: {exc}")
+                self._post("error", f"Не удалось подготовить модель: {exc}")
             finally:
                 self.is_busy = False
+                self.recognition_started_at = None
                 self._set_tray_icon("idle")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -415,39 +547,213 @@ class VoiceTypingApp:
     def _build_status_window(self) -> None:
         window = tk.Toplevel(self.root)
         self.status_window = window
-        window.withdraw()
         window.overrideredirect(True)
         window.attributes("-topmost", True)
-        label = ttk.Label(window, textvariable=self.status_var, padding=(14, 10), background="#202124", foreground="white")
-        label.pack(fill="both", expand=True)
+        window.configure(bg="#ff00ff")
+        try:
+            window.attributes("-transparentcolor", "#ff00ff")
+        except tk.TclError:
+            window.attributes("-alpha", 0.97)
+
+        canvas = tk.Canvas(
+            window,
+            width=self._float_width,
+            height=self._float_height,
+            bg="#ff00ff",
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.float_canvas = canvas
+        canvas.pack(fill="both", expand=True)
+        canvas.bind("<ButtonPress-1>", self._start_float_drag)
+        canvas.bind("<B1-Motion>", self._drag_float)
+        canvas.bind("<ButtonRelease-1>", self._finish_float_action)
+        canvas.bind("<Button-3>", lambda _event: self.show_settings())
+
+        self._place_floating_window()
+        self._refresh_floating()
 
     def _show_status_window(self, auto_hide: bool = False) -> None:
         if not self.settings.show_status_window or not self.status_window:
+            if self.status_window:
+                self.status_window.withdraw()
             return
-        self.status_window.update_idletasks()
-        width = max(360, self.status_window.winfo_reqwidth())
-        height = max(52, self.status_window.winfo_reqheight())
-        screen_w = self.status_window.winfo_screenwidth()
-        screen_h = self.status_window.winfo_screenheight()
-        x = screen_w - width - 28
-        y = screen_h - height - 76
-        self.status_window.geometry(f"{width}x{height}+{x}+{y}")
         self.status_window.deiconify()
-        if auto_hide:
-            self.root.after(2600, self.status_window.withdraw)
+        self._refresh_floating()
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
-        if self.settings.show_status_window and (self.is_recording or self.is_busy):
-            self._show_status_window()
+        self._refresh_floating()
 
     def _show_error(self, text: str) -> None:
         self.is_busy = False
         self.is_recording = False
+        self.recording_started_at = None
+        self.recognition_started_at = None
+        self.float_feedback = ("error", time.monotonic() + 5.0)
         self._set_tray_icon("idle")
         self._set_status(text)
-        self._show_status_window(auto_hide=True)
-        messagebox.showerror(APP_NAME, text)
+        self._show_status_window()
+
+    def _place_floating_window(self) -> None:
+        if not self.status_window:
+            return
+        width = self._float_width
+        height = self._float_height
+        screen_w = self.status_window.winfo_screenwidth()
+        screen_h = self.status_window.winfo_screenheight()
+        x = self.settings.floating_x
+        y = self.settings.floating_y
+        if x is None or y is None:
+            x = screen_w - width - 28
+            y = screen_h - height - 88
+        x = max(0, min(int(x), screen_w - width))
+        y = max(0, min(int(y), screen_h - height))
+        self.status_window.geometry(f"{width}x{height}+{x}+{y}")
+        if self.settings.show_status_window:
+            self.status_window.deiconify()
+        else:
+            self.status_window.withdraw()
+
+    def _start_float_drag(self, event: tk.Event) -> None:
+        if not self.status_window:
+            return
+        self._drag_start = (event.x_root, event.y_root, self.status_window.winfo_x(), self.status_window.winfo_y())
+        self._drag_moved = False
+
+    def _drag_float(self, event: tk.Event) -> None:
+        if not self.status_window or not self._drag_start:
+            return
+        start_x, start_y, win_x, win_y = self._drag_start
+        dx = event.x_root - start_x
+        dy = event.y_root - start_y
+        if abs(dx) > 8 or abs(dy) > 8:
+            self._drag_moved = True
+        self.status_window.geometry(f"+{win_x + dx}+{win_y + dy}")
+
+    def _finish_float_action(self, _event: tk.Event) -> None:
+        if not self.status_window:
+            return
+        if self._drag_moved:
+            self.settings.floating_x = self.status_window.winfo_x()
+            self.settings.floating_y = self.status_window.winfo_y()
+            save_settings(self.settings)
+        else:
+            self.toggle_recording()
+        self._drag_start = None
+        self._drag_moved = False
+
+    def _tick(self) -> None:
+        self._refresh_floating()
+        self.root.after(250, self._tick)
+
+    def _refresh_floating(self) -> None:
+        state = "idle"
+        elapsed: float | None = None
+        now = time.monotonic()
+        if self.is_recording and self.recording_started_at is not None:
+            state = "recording"
+            elapsed = now - self.recording_started_at
+            self._draw_float_button(state, elapsed)
+            return
+        if self.is_busy and self.recognition_started_at is not None:
+            state = "processing"
+            elapsed = now - self.recognition_started_at
+            self._draw_float_button(state, elapsed)
+            return
+
+        if self.float_feedback:
+            feedback_state, feedback_until = self.float_feedback
+            if now <= feedback_until:
+                state = feedback_state
+            else:
+                self.float_feedback = None
+        self._draw_float_button(state, elapsed)
+
+    def _draw_float_button(self, state: str, elapsed: float | None = None) -> None:
+        canvas = self.float_canvas
+        if not canvas:
+            return
+        tick = int(time.monotonic() * 8)
+        canvas.delete("all")
+        image = self._render_float_button(state, elapsed, tick)
+        self.float_photo = ImageTk.PhotoImage(image)
+        canvas.create_image(0, 0, anchor="nw", image=self.float_photo)
+
+    def _render_float_button(self, state: str, elapsed: float | None, tick: int) -> Image.Image:
+        scale = 4
+        width = self._float_width
+        height = self._float_height
+        image = Image.new("RGBA", (width * scale, height * scale), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+
+        def box(values: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+            return tuple(value * scale for value in values)  # type: ignore[return-value]
+
+        def rgba(hex_color: str, alpha: int = 255) -> tuple[int, int, int, int]:
+            value = hex_color.lstrip("#")
+            return (
+                int(value[0:2], 16),
+                int(value[2:4], 16),
+                int(value[4:6], 16),
+                alpha,
+            )
+
+        if state == "recording":
+            button = (7, 6, 97, 46)
+            draw.rounded_rectangle(box(button), radius=20 * scale, fill=rgba("#ff3b30"), outline=rgba("#ff8a84"), width=1 * scale)
+            draw.rounded_rectangle(box((26, 22, 34, 30)), radius=2 * scale, fill=rgba("#ffffff", 245))
+            text = self._format_elapsed(elapsed or 0)
+            font = self._float_font(15 * scale, bold=True)
+            text_box = draw.textbbox((0, 0), text, font=font)
+            text_x = 48 * scale
+            text_y = ((height * scale) - (text_box[3] - text_box[1])) // 2 - scale
+            draw.text((text_x, text_y), text, font=font, fill=rgba("#ffffff"))
+        elif state == "processing":
+            center_x = width // 2
+            center_y = height // 2
+            draw.rounded_rectangle(box((24, 6, 80, 46)), radius=20 * scale, fill=rgba("#ffffff", 252), outline=rgba("#d8d8d2"), width=1 * scale)
+            draw.ellipse(box((center_x - 11, center_y - 11, center_x + 11, center_y + 11)), outline=rgba("#deded8"), width=3 * scale)
+            start = (tick * 24) % 360
+            draw.arc(box((center_x - 11, center_y - 11, center_x + 11, center_y + 11)), start=start, end=start + 110, fill=rgba("#1f1f1f"), width=3 * scale)
+        elif state == "error":
+            center_x = width // 2
+            center_y = height // 2
+            draw.rounded_rectangle(box((24, 6, 80, 46)), radius=20 * scale, fill=rgba("#ffffff", 252), outline=rgba("#ff3b30"), width=2 * scale)
+            draw.ellipse(box((center_x - 4, center_y - 4, center_x + 4, center_y + 4)), fill=rgba("#ff3b30"))
+        elif state == "success":
+            center_x = width // 2
+            center_y = height // 2
+            draw.rounded_rectangle(box((24, 6, 80, 46)), radius=20 * scale, fill=rgba("#ffffff", 252), outline=rgba("#d8d8d2"), width=1 * scale)
+            draw.ellipse(box((center_x - 5, center_y - 5, center_x + 5, center_y + 5)), fill=rgba("#22c55e"))
+        else:
+            center_x = width // 2
+            center_y = height // 2
+            draw.rounded_rectangle(box((24, 6, 80, 46)), radius=20 * scale, fill=rgba("#ffffff", 252), outline=rgba("#d8d8d2"), width=1 * scale)
+            draw.ellipse(box((center_x - 4, center_y - 4, center_x + 4, center_y + 4)), fill=rgba("#ff3b30"))
+
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+        alpha = image.getchannel("A").point(lambda value: 255 if value >= 220 else 0)
+        image.putalpha(alpha)
+        return image
+
+    @staticmethod
+    def _float_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        font_name = "segoeuib.ttf" if bold else "segoeui.ttf"
+        font_path = Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts" / font_name
+        try:
+            return ImageFont.truetype(str(font_path), size)
+        except OSError:
+            return ImageFont.load_default()
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds))
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    @staticmethod
+    def _short_status(text: str) -> str:
+        return text if len(text) <= 24 else text[:23].rstrip() + "…"
 
     def _set_tray_icon(self, mode: str) -> None:
         if self.tray_icon:

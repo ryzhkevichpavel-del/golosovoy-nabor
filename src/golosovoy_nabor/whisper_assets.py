@@ -15,8 +15,11 @@ WHISPER_CPP_URL = (
     f"{WHISPER_CPP_VERSION}/whisper-bin-x64.zip"
 )
 MODEL_URLS = {
+    "tiny": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
     "base": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+    "base-q5_1": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin",
     "small": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+    "small-q5_1": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
     "medium": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
 }
 

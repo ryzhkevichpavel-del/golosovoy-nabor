@@ -37,14 +37,17 @@ DEFAULT_HISTORY_DIR = _documents_dir() / "Голосовой набор" / "Ис
 
 @dataclass
 class AppSettings:
-    provider: str = "local_whisper_cpp"
-    hotkey: str = "<ctrl>+<alt>+space"
-    language: str = "auto"
+    settings_version: int = 5
+    provider: str = "faster_whisper"
+    hotkey: str = "<f8>"
+    language: str = "ru"
     model_name: str = "base"
     history_dir: str = str(DEFAULT_HISTORY_DIR)
     save_history: bool = True
     auto_paste: bool = True
     show_status_window: bool = True
+    floating_x: int | None = None
+    floating_y: int | None = None
     device_index: int | None = None
     sample_rate: int = 16000
     threads: int = max(1, min(4, (os.cpu_count() or 2)))
@@ -76,6 +79,24 @@ def load_settings() -> AppSettings:
 
     defaults = asdict(AppSettings())
     merged: dict[str, Any] = {**defaults, **{k: v for k, v in raw.items() if k in defaults}}
+    if int(raw.get("settings_version", 0) or 0) < 2:
+        if merged.get("hotkey") == "<ctrl>+<alt>+space":
+            merged["hotkey"] = defaults["hotkey"]
+        if merged.get("language") == "auto":
+            merged["language"] = defaults["language"]
+        merged["settings_version"] = defaults["settings_version"]
+    if int(raw.get("settings_version", 0) or 0) < 3:
+        if merged.get("model_name") in {"tiny", "base"}:
+            merged["model_name"] = defaults["model_name"]
+        merged["settings_version"] = defaults["settings_version"]
+    if int(raw.get("settings_version", 0) or 0) < 4:
+        if merged.get("model_name") == "base":
+            merged["model_name"] = defaults["model_name"]
+        merged["settings_version"] = defaults["settings_version"]
+    if int(raw.get("settings_version", 0) or 0) < 5:
+        merged["provider"] = defaults["provider"]
+        merged["model_name"] = "base"
+        merged["settings_version"] = defaults["settings_version"]
     settings = AppSettings(**merged)
     ensure_app_dirs(settings)
     return settings

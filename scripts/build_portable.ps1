@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Python = ".\.venv\Scripts\python.exe"
 )
 
@@ -44,7 +44,7 @@ New-Item -ItemType Directory -Path $PackageDir | Out-Null
 Copy-Item -LiteralPath "dist\Голосовой набор.exe" -Destination $PackageDir
 Copy-Item -LiteralPath "README.md" -Destination (Join-Path $PackageDir "README.md")
 Get-Content -LiteralPath "scripts\install_desktop.ps1" -Raw |
-    Set-Content -LiteralPath (Join-Path $PackageDir "Установить на рабочий стол.ps1") -Encoding utf8BOM
+    Set-Content -LiteralPath (Join-Path $PackageDir "Установить на рабочий стол.ps1") -Encoding UTF8
 
 $Bat = @"
 @echo off
@@ -58,8 +58,8 @@ $ReadmeTxt = @"
 
 1. Запустите файл "Голосовой набор.exe".
 2. Иконка появится возле часов.
-3. Горячая клавиша: Ctrl + Alt + Space.
-4. Первый запуск может скачать бесплатный локальный Whisper.
+3. Горячая клавиша: F8.
+4. Первый запуск может подготовить бесплатную локальную модель.
 "@
 $ReadmeTxt | Set-Content -Path (Join-Path $PackageDir "Прочитай меня.txt") -Encoding UTF8
 

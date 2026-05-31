@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,9 +76,16 @@ class WhisperCppTranscriber:
                 "-np",
                 "-t",
                 str(max(1, self.settings.threads)),
+                "-bo",
+                "1",
+                "-bs",
+                "1",
+                "-nf",
+                "-sns",
             ]
-            if self.settings.language != "auto":
-                command.extend(["-l", self.settings.language])
+            command.extend(["-l", self.settings.language or "ru"])
+            if self.settings.language == "ru":
+                command.extend(["--prompt", "Это русский текст. Расставь знаки препинания."])
 
             startupinfo = None
             creationflags = 0
@@ -111,3 +119,56 @@ class WhisperCppTranscriber:
             if not text:
                 raise TranscriptionError("Whisper вернул пустой текст. Возможно, запись была слишком тихой.")
             return Transcript(text=text, provider="local_whisper_cpp", model=self.settings.model_name)
+
+
+class FasterWhisperTranscriber:
+    def __init__(self, settings: AppSettings):
+        self.settings = settings
+        self.model_name = settings.model_name if settings.model_name in {"tiny", "base", "small", "medium"} else "base"
+        self._model = None
+        self._lock = threading.Lock()
+
+    def warm_up(self) -> None:
+        self._get_model()
+
+    def transcribe(self, wav_path: Path) -> Transcript:
+        wav_path = wav_path.resolve()
+        if not wav_path.exists():
+            raise TranscriptionError("Не найден записанный аудиофайл.")
+
+        model = self._get_model()
+        try:
+            segments, _info = model.transcribe(
+                str(wav_path),
+                language=self.settings.language or "ru",
+                beam_size=1,
+                best_of=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                initial_prompt="Это русский текст. Расставь знаки препинания.",
+            )
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+        except Exception as exc:
+            raise TranscriptionError(f"Не удалось распознать запись: {exc}") from exc
+
+        if not text:
+            raise TranscriptionError("Не услышал голос. Попробуй сказать чуть громче.")
+        return Transcript(text=text, provider="faster_whisper", model=self.model_name)
+
+    def _get_model(self):  # noqa: ANN202
+        with self._lock:
+            if self._model is not None:
+                return self._model
+            os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+            from faster_whisper import WhisperModel
+
+            download_root = MODEL_DIR / "faster-whisper"
+            download_root.mkdir(parents=True, exist_ok=True)
+            self._model = WhisperModel(
+                self.model_name,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=max(1, self.settings.threads),
+                download_root=str(download_root),
+            )
+            return self._model
