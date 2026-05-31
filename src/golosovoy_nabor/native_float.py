@@ -511,7 +511,8 @@ class NativeFloatButton:
             font = _float_font(20 * scale, bold=False)
             text_box = draw.textbbox((0, 0), text, font=font)
             text_x = 62 * scale
-            text_y = ((height * scale) - (text_box[3] - text_box[1])) // 2 - (3 * scale)
+            text_center_y = (body[1] + body[3]) * scale / 2
+            text_y = int(text_center_y - (text_box[1] + text_box[3]) / 2)
             draw.text((text_x, text_y), text, font=font, fill=rgba("#ffffff", 244))
         else:
             shadow(body, body_radius, 24, 7, 5)
