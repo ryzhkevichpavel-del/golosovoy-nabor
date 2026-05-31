@@ -571,8 +571,8 @@ class VoiceTypingApp:
         self._show_status_window()
 
     def _default_float_position(self) -> tuple[int, int]:
-        width = 140
-        height = 64
+        width = 144
+        height = 68
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         x = self.settings.floating_x

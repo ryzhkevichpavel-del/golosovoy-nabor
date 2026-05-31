@@ -113,8 +113,8 @@ class NativeFloatButton:
         self.visible = True
         self.x = 0
         self.y = 0
-        self.width = 102
-        self.height = 64
+        self.width = 106
+        self.height = 68
         self.hwnd = 0
         self.thread_id = 0
         self._ready = threading.Event()
@@ -448,9 +448,9 @@ class NativeFloatButton:
     def _render(self) -> Image.Image:
         state = self.state
         if state == "recording":
-            width, height = 140, 64
+            width, height = 144, 68
         else:
-            width, height = 102, 64
+            width, height = 106, 68
         scale = 4
         image = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
@@ -498,29 +498,28 @@ class NativeFloatButton:
                     gradient_pixels[x_pos, y_pos] = (*color, 255)
             image.paste(gradient, (0, 0), mask)
 
-        body = (8, 8, width - 8, height - 8)
+        body = (8, 8, width - 8, 56)
         body_radius = 24
 
         if state == "recording":
-            shadow(body, body_radius, 36, 7, 5)
-            shadow(body, body_radius, 22, 15, 8)
+            shadow(body, body_radius, 16, 5, 3)
+            shadow(body, body_radius, 6, 8, 5)
             rounded_gradient(body, body_radius, "#2a2a2a", "#101010")
-            draw.rounded_rectangle(box(body), radius=body_radius * scale, outline=rgba("#353535"), width=1 * scale)
-            draw.rounded_rectangle(box((34, 26, 46, 38)), radius=3 * scale, fill=rgba("#ffffff", 246))
+            draw.rounded_rectangle(box(body), radius=body_radius * scale, outline=rgba("#353535", 95), width=1 * scale)
+            draw.rounded_rectangle(box((35, 26, 47, 38)), radius=3 * scale, fill=rgba("#ffffff", 246))
             text = _format_elapsed(self.elapsed)
             font = _float_font(20 * scale, bold=False)
             text_box = draw.textbbox((0, 0), text, font=font)
-            text_x = 62 * scale
+            text_x = 64 * scale
             text_center_y = (body[1] + body[3]) * scale / 2
             text_y = int(text_center_y - (text_box[1] + text_box[3]) / 2)
             draw.text((text_x, text_y), text, font=font, fill=rgba("#ffffff", 244))
         else:
-            shadow(body, body_radius, 24, 7, 5)
-            shadow(body, body_radius, 12, 14, 8)
+            shadow(body, body_radius, 10, 5, 3)
+            shadow(body, body_radius, 4, 8, 5)
             rounded_gradient(body, body_radius, "#ffffff", "#f4f4f1")
-            draw.rounded_rectangle(box(body), radius=body_radius * scale, outline=rgba("#d7d6d1"), width=1 * scale)
-            draw.arc(box((18, 9, width - 18, 32)), start=200, end=340, fill=rgba("#ffffff", 150), width=1 * scale)
-            center_x, center_y = width // 2, height // 2
+            center_x = width // 2
+            center_y = (body[1] + body[3]) // 2
             if state == "processing":
                 draw.ellipse(box((center_x - 12, center_y - 12, center_x + 12, center_y + 12)), outline=rgba("#d7d7d2"), width=4 * scale)
                 start = (int(time.monotonic() * 8) * 24) % 360
