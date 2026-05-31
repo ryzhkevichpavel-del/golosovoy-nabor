@@ -12,13 +12,14 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 import pystray
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw
 from pynput import keyboard
 
 from .audio_recorder import AudioRecorder, list_input_devices
 from .config import APP_NAME, AUDIO_DIR, ensure_app_dirs, load_settings, save_settings
 from .history import list_history, save_transcript
 from .insert import paste_text
+from .native_float import NativeFloatButton
 from .startup import current_executable, is_run_on_startup, set_run_on_startup
 from .transcribers import FasterWhisperTranscriber, MissingBackendError, TranscriptionError, WhisperCppTranscriber
 from .whisper_assets import backend_ready, ensure_backend
@@ -102,23 +103,16 @@ class VoiceTypingApp:
         self.tray_icon: pystray.Icon | None = None
         self.hotkey_listener: object | None = None
         self.ui_queue: queue.Queue[tuple[str, object | None]] = queue.Queue()
-        self.status_window: tk.Toplevel | None = None
+        self.status_window: NativeFloatButton | None = None
         self.settings_window: tk.Toplevel | None = None
         self.history_window: tk.Toplevel | None = None
         self.device_options: list[tuple[int, str]] = []
-        self.float_state = "idle"
-        self.float_canvas: tk.Canvas | None = None
-        self.float_photo: ImageTk.PhotoImage | None = None
         self.float_feedback: tuple[str, float] | None = None
         self.recording_started_at: float | None = None
         self.recognition_started_at: float | None = None
         self.transcriber: FasterWhisperTranscriber | WhisperCppTranscriber | None = None
         self.transcriber_lock = threading.Lock()
         self.last_toggle_at = 0.0
-        self._drag_start: tuple[int, int, int, int] | None = None
-        self._drag_moved = False
-        self._float_width = 104
-        self._float_height = 52
 
     def run(self) -> None:
         self._build_status_window()
@@ -126,7 +120,7 @@ class VoiceTypingApp:
         self._start_hotkey()
         self.root.after(150, self._drain_ui_queue)
         self.root.after(250, self._tick)
-        self.root.after(700, self._warm_up_transcriber)
+        self._warm_up_transcriber()
         self.root.mainloop()
 
     def _start_tray(self) -> None:
@@ -545,40 +539,21 @@ class VoiceTypingApp:
                 window.withdraw()
 
     def _build_status_window(self) -> None:
-        window = tk.Toplevel(self.root)
-        self.status_window = window
-        window.overrideredirect(True)
-        window.attributes("-topmost", True)
-        window.configure(bg="#ff00ff")
-        try:
-            window.attributes("-transparentcolor", "#ff00ff")
-        except tk.TclError:
-            window.attributes("-alpha", 0.97)
-
-        canvas = tk.Canvas(
-            window,
-            width=self._float_width,
-            height=self._float_height,
-            bg="#ff00ff",
-            highlightthickness=0,
-            cursor="hand2",
+        x, y = self._default_float_position()
+        self.status_window = NativeFloatButton(
+            on_click=lambda: self._post("toggle"),
+            on_right_click=lambda: self._post("settings"),
+            on_moved=self._save_float_position,
         )
-        self.float_canvas = canvas
-        canvas.pack(fill="both", expand=True)
-        canvas.bind("<ButtonPress-1>", self._start_float_drag)
-        canvas.bind("<B1-Motion>", self._drag_float)
-        canvas.bind("<ButtonRelease-1>", self._finish_float_action)
-        canvas.bind("<Button-3>", lambda _event: self.show_settings())
-
-        self._place_floating_window()
+        self.status_window.start(x, y, visible=self.settings.show_status_window)
         self._refresh_floating()
 
     def _show_status_window(self, auto_hide: bool = False) -> None:
         if not self.settings.show_status_window or not self.status_window:
             if self.status_window:
-                self.status_window.withdraw()
+                self.status_window.set_visible(False)
             return
-        self.status_window.deiconify()
+        self.status_window.set_visible(True)
         self._refresh_floating()
 
     def _set_status(self, text: str) -> None:
@@ -595,13 +570,11 @@ class VoiceTypingApp:
         self._set_status(text)
         self._show_status_window()
 
-    def _place_floating_window(self) -> None:
-        if not self.status_window:
-            return
-        width = self._float_width
-        height = self._float_height
-        screen_w = self.status_window.winfo_screenwidth()
-        screen_h = self.status_window.winfo_screenheight()
+    def _default_float_position(self) -> tuple[int, int]:
+        width = 140
+        height = 64
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
         x = self.settings.floating_x
         y = self.settings.floating_y
         if x is None or y is None:
@@ -609,57 +582,32 @@ class VoiceTypingApp:
             y = screen_h - height - 88
         x = max(0, min(int(x), screen_w - width))
         y = max(0, min(int(y), screen_h - height))
-        self.status_window.geometry(f"{width}x{height}+{x}+{y}")
-        if self.settings.show_status_window:
-            self.status_window.deiconify()
-        else:
-            self.status_window.withdraw()
+        return x, y
 
-    def _start_float_drag(self, event: tk.Event) -> None:
-        if not self.status_window:
-            return
-        self._drag_start = (event.x_root, event.y_root, self.status_window.winfo_x(), self.status_window.winfo_y())
-        self._drag_moved = False
-
-    def _drag_float(self, event: tk.Event) -> None:
-        if not self.status_window or not self._drag_start:
-            return
-        start_x, start_y, win_x, win_y = self._drag_start
-        dx = event.x_root - start_x
-        dy = event.y_root - start_y
-        if abs(dx) > 8 or abs(dy) > 8:
-            self._drag_moved = True
-        self.status_window.geometry(f"+{win_x + dx}+{win_y + dy}")
-
-    def _finish_float_action(self, _event: tk.Event) -> None:
-        if not self.status_window:
-            return
-        if self._drag_moved:
-            self.settings.floating_x = self.status_window.winfo_x()
-            self.settings.floating_y = self.status_window.winfo_y()
-            save_settings(self.settings)
-        else:
-            self.toggle_recording()
-        self._drag_start = None
-        self._drag_moved = False
+    def _save_float_position(self, x: int, y: int) -> None:
+        self.settings.floating_x = int(x)
+        self.settings.floating_y = int(y)
+        save_settings(self.settings)
 
     def _tick(self) -> None:
         self._refresh_floating()
         self.root.after(250, self._tick)
 
     def _refresh_floating(self) -> None:
+        if not self.status_window:
+            return
         state = "idle"
         elapsed: float | None = None
         now = time.monotonic()
         if self.is_recording and self.recording_started_at is not None:
             state = "recording"
             elapsed = now - self.recording_started_at
-            self._draw_float_button(state, elapsed)
+            self.status_window.set_state(state, elapsed)
             return
         if self.is_busy and self.recognition_started_at is not None:
             state = "processing"
             elapsed = now - self.recognition_started_at
-            self._draw_float_button(state, elapsed)
+            self.status_window.set_state(state, elapsed)
             return
 
         if self.float_feedback:
@@ -668,92 +616,7 @@ class VoiceTypingApp:
                 state = feedback_state
             else:
                 self.float_feedback = None
-        self._draw_float_button(state, elapsed)
-
-    def _draw_float_button(self, state: str, elapsed: float | None = None) -> None:
-        canvas = self.float_canvas
-        if not canvas:
-            return
-        tick = int(time.monotonic() * 8)
-        canvas.delete("all")
-        image = self._render_float_button(state, elapsed, tick)
-        self.float_photo = ImageTk.PhotoImage(image)
-        canvas.create_image(0, 0, anchor="nw", image=self.float_photo)
-
-    def _render_float_button(self, state: str, elapsed: float | None, tick: int) -> Image.Image:
-        scale = 4
-        width = self._float_width
-        height = self._float_height
-        image = Image.new("RGBA", (width * scale, height * scale), (255, 255, 255, 0))
-        draw = ImageDraw.Draw(image)
-
-        def box(values: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-            return tuple(value * scale for value in values)  # type: ignore[return-value]
-
-        def rgba(hex_color: str, alpha: int = 255) -> tuple[int, int, int, int]:
-            value = hex_color.lstrip("#")
-            return (
-                int(value[0:2], 16),
-                int(value[2:4], 16),
-                int(value[4:6], 16),
-                alpha,
-            )
-
-        if state == "recording":
-            button = (7, 6, 97, 46)
-            draw.rounded_rectangle(box(button), radius=20 * scale, fill=rgba("#ff3b30"), outline=rgba("#ff8a84"), width=1 * scale)
-            draw.rounded_rectangle(box((26, 22, 34, 30)), radius=2 * scale, fill=rgba("#ffffff", 245))
-            text = self._format_elapsed(elapsed or 0)
-            font = self._float_font(15 * scale, bold=True)
-            text_box = draw.textbbox((0, 0), text, font=font)
-            text_x = 48 * scale
-            text_y = ((height * scale) - (text_box[3] - text_box[1])) // 2 - scale
-            draw.text((text_x, text_y), text, font=font, fill=rgba("#ffffff"))
-        elif state == "processing":
-            center_x = width // 2
-            center_y = height // 2
-            draw.rounded_rectangle(box((24, 6, 80, 46)), radius=20 * scale, fill=rgba("#ffffff", 252), outline=rgba("#d8d8d2"), width=1 * scale)
-            draw.ellipse(box((center_x - 11, center_y - 11, center_x + 11, center_y + 11)), outline=rgba("#deded8"), width=3 * scale)
-            start = (tick * 24) % 360
-            draw.arc(box((center_x - 11, center_y - 11, center_x + 11, center_y + 11)), start=start, end=start + 110, fill=rgba("#1f1f1f"), width=3 * scale)
-        elif state == "error":
-            center_x = width // 2
-            center_y = height // 2
-            draw.rounded_rectangle(box((24, 6, 80, 46)), radius=20 * scale, fill=rgba("#ffffff", 252), outline=rgba("#ff3b30"), width=2 * scale)
-            draw.ellipse(box((center_x - 4, center_y - 4, center_x + 4, center_y + 4)), fill=rgba("#ff3b30"))
-        elif state == "success":
-            center_x = width // 2
-            center_y = height // 2
-            draw.rounded_rectangle(box((24, 6, 80, 46)), radius=20 * scale, fill=rgba("#ffffff", 252), outline=rgba("#d8d8d2"), width=1 * scale)
-            draw.ellipse(box((center_x - 5, center_y - 5, center_x + 5, center_y + 5)), fill=rgba("#22c55e"))
-        else:
-            center_x = width // 2
-            center_y = height // 2
-            draw.rounded_rectangle(box((24, 6, 80, 46)), radius=20 * scale, fill=rgba("#ffffff", 252), outline=rgba("#d8d8d2"), width=1 * scale)
-            draw.ellipse(box((center_x - 4, center_y - 4, center_x + 4, center_y + 4)), fill=rgba("#ff3b30"))
-
-        image = image.resize((width, height), Image.Resampling.LANCZOS)
-        alpha = image.getchannel("A").point(lambda value: 255 if value >= 220 else 0)
-        image.putalpha(alpha)
-        return image
-
-    @staticmethod
-    def _float_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-        font_name = "segoeuib.ttf" if bold else "segoeui.ttf"
-        font_path = Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts" / font_name
-        try:
-            return ImageFont.truetype(str(font_path), size)
-        except OSError:
-            return ImageFont.load_default()
-
-    @staticmethod
-    def _format_elapsed(seconds: float) -> str:
-        total = max(0, int(seconds))
-        return f"{total // 60:02d}:{total % 60:02d}"
-
-    @staticmethod
-    def _short_status(text: str) -> str:
-        return text if len(text) <= 24 else text[:23].rstrip() + "…"
+        self.status_window.set_state(state, elapsed)
 
     def _set_tray_icon(self, mode: str) -> None:
         if self.tray_icon:
@@ -763,7 +626,7 @@ class VoiceTypingApp:
     def _make_icon(mode: str) -> Image.Image:
         colors = {
             "idle": ("#2563eb", "#ffffff"),
-            "recording": ("#dc2626", "#ffffff"),
+            "recording": ("#151515", "#ffffff"),
             "busy": ("#f59e0b", "#111827"),
         }
         bg, fg = colors.get(mode, colors["idle"])
@@ -785,6 +648,11 @@ class VoiceTypingApp:
         try:
             if self.tray_icon:
                 self.tray_icon.stop()
+        except Exception:
+            pass
+        try:
+            if self.status_window:
+                self.status_window.stop()
         except Exception:
             pass
         self.root.quit()
