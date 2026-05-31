@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,7 +86,7 @@ class WhisperCppTranscriber:
             ]
             command.extend(["-l", self.settings.language or "ru"])
             if self.settings.language == "ru":
-                command.extend(["--prompt", "Это русский текст. Расставь знаки препинания."])
+                command.extend(["--prompt", "Русская речь."])
 
             startupinfo = None
             creationflags = 0
@@ -138,16 +139,18 @@ class FasterWhisperTranscriber:
 
         model = self._get_model()
         try:
-            segments, _info = model.transcribe(
-                str(wav_path),
-                language=self.settings.language or "ru",
-                beam_size=1,
-                best_of=1,
-                vad_filter=False,
-                condition_on_previous_text=False,
-                initial_prompt="Это русский текст. Расставь знаки препинания.",
-            )
-            text = " ".join(segment.text.strip() for segment in segments).strip()
+            language = None if self.settings.language == "auto" else (self.settings.language or "ru")
+            duration = _wav_duration(wav_path)
+            vad_choices = [duration >= 12.0, False] if duration is not None and duration >= 12.0 else [False]
+            text = ""
+            for vad_filter in dict.fromkeys(vad_choices):
+                text = self._transcribe_once(model, wav_path, language, vad_filter=vad_filter, beam_size=1)
+                if language == "ru" and _latin_ratio(text) > 0.25:
+                    retry_text = self._transcribe_once(model, wav_path, language, vad_filter=vad_filter, beam_size=3)
+                    if retry_text and _latin_ratio(retry_text) < _latin_ratio(text):
+                        text = retry_text
+                if text:
+                    break
         except Exception as exc:
             raise TranscriptionError(f"Не удалось распознать запись: {exc}") from exc
 
@@ -172,3 +175,31 @@ class FasterWhisperTranscriber:
                 download_root=str(download_root),
             )
             return self._model
+
+    @staticmethod
+    def _transcribe_once(model, wav_path: Path, language: str | None, *, vad_filter: bool, beam_size: int) -> str:  # noqa: ANN001
+        segments, _info = model.transcribe(
+            str(wav_path),
+            language=language,
+            beam_size=beam_size,
+            best_of=1,
+            vad_filter=vad_filter,
+            condition_on_previous_text=False,
+        )
+        return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def _wav_duration(wav_path: Path) -> float | None:
+    try:
+        with wave.open(str(wav_path), "rb") as wav:
+            return wav.getnframes() / float(wav.getframerate())
+    except (OSError, EOFError, wave.Error, ZeroDivisionError):
+        return None
+
+
+def _latin_ratio(text: str) -> float:
+    letters = [char for char in text if char.isalpha()]
+    if not letters:
+        return 0.0
+    latin = sum("a" <= char.lower() <= "z" for char in letters)
+    return latin / len(letters)

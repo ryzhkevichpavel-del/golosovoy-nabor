@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 APP_ID = "GolosovoyNabor"
-APP_NAME = "Голосовой набор"
-APP_NAME_ASCII = "Golosovoy Nabor"
+APP_NAME = "Глас"
+APP_NAME_ASCII = "Glas"
 
 
 def _local_app_data() -> Path:
@@ -32,7 +32,7 @@ MODEL_DIR = APP_DIR / "models"
 AUDIO_DIR = APP_DIR / "audio"
 LOG_DIR = APP_DIR / "logs"
 SETTINGS_PATH = APP_DIR / "settings.json"
-DEFAULT_HISTORY_DIR = _documents_dir() / "Голосовой набор" / "История"
+DEFAULT_HISTORY_DIR = _documents_dir() / "Глас" / "История"
 
 
 @dataclass

@@ -64,15 +64,26 @@ class WNDCLASS(ctypes.Structure):
     ]
 
 
+class TRACKMOUSEEVENT(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("hwndTrack", ctypes.wintypes.HWND),
+        ("dwHoverTime", ctypes.wintypes.DWORD),
+    ]
+
+
 class NativeFloatButton:
     _api_configured = False
 
     WM_APP_UPDATE = 0x8001
     WM_CLOSE = 0x0010
     WM_DESTROY = 0x0002
+    WM_SETCURSOR = 0x0020
     WM_LBUTTONDOWN = 0x0201
     WM_LBUTTONUP = 0x0202
     WM_MOUSEMOVE = 0x0200
+    WM_MOUSELEAVE = 0x02A3
     WM_RBUTTONUP = 0x0205
     WM_MOUSEACTIVATE = 0x0021
     WM_NCHITTEST = 0x0084
@@ -96,8 +107,10 @@ class NativeFloatButton:
     ULW_ALPHA = 0x00000002
     AC_SRC_OVER = 0
     AC_SRC_ALPHA = 1
+    TME_LEAVE = 0x00000002
     BI_RGB = 0
     DIB_RGB_COLORS = 0
+    IDC_HAND = 32649
 
     def __init__(
         self,
@@ -124,6 +137,8 @@ class NativeFloatButton:
         self._drag_start: tuple[int, int, int, int] | None = None
         self._drag_moved = False
         self._captured = False
+        self._hovered = False
+        self._tracking_mouse = False
         self._last_tick = 0
         self._configure_win32_api()
 
@@ -201,6 +216,12 @@ class NativeFloatButton:
         user32.SetCapture.restype = ctypes.wintypes.HWND
         user32.ReleaseCapture.argtypes = []
         user32.ReleaseCapture.restype = ctypes.wintypes.BOOL
+        user32.LoadCursorW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.LoadCursorW.restype = ctypes.wintypes.HANDLE
+        user32.SetCursor.argtypes = [ctypes.wintypes.HANDLE]
+        user32.SetCursor.restype = ctypes.wintypes.HANDLE
+        user32.TrackMouseEvent.argtypes = [ctypes.POINTER(TRACKMOUSEEVENT)]
+        user32.TrackMouseEvent.restype = ctypes.wintypes.BOOL
         user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
         user32.GetCursorPos.restype = ctypes.wintypes.BOOL
         user32.GetDC.argtypes = [ctypes.wintypes.HWND]
@@ -287,6 +308,7 @@ class NativeFloatButton:
         wndclass = WNDCLASS()
         wndclass.lpfnWndProc = ctypes.cast(self._wndproc_ref, ctypes.c_void_p).value
         wndclass.hInstance = hinstance
+        wndclass.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(self.IDC_HAND))
         wndclass.lpszClassName = class_name
         user32.RegisterClassW(ctypes.byref(wndclass))
 
@@ -320,6 +342,9 @@ class NativeFloatButton:
             return 0
         if msg == self.WM_MOUSEACTIVATE:
             return self.MA_NOACTIVATE
+        if msg == self.WM_SETCURSOR:
+            user32.SetCursor(user32.LoadCursorW(None, ctypes.c_void_p(self.IDC_HAND)))
+            return 1
         if msg == self.WM_NCHITTEST:
             return self.HTCLIENT
         if msg == self.WM_LBUTTONDOWN:
@@ -328,6 +353,13 @@ class NativeFloatButton:
             self._drag_moved = False
             self._captured = True
             user32.SetCapture(hwnd)
+            return 0
+        if msg == self.WM_MOUSEMOVE and not self._captured:
+            if not self._hovered:
+                self._hovered = True
+                self._redraw()
+            if not self._tracking_mouse:
+                self._track_mouse_leave(hwnd)
             return 0
         if msg == self.WM_MOUSEMOVE and self._captured and self._drag_start:
             point = self._cursor_pos()
@@ -348,6 +380,12 @@ class NativeFloatButton:
                     0,
                     self.SWP_NOSIZE | self.SWP_NOACTIVATE,
                 )
+            return 0
+        if msg == self.WM_MOUSELEAVE:
+            self._tracking_mouse = False
+            if self._hovered:
+                self._hovered = False
+                self._redraw()
             return 0
         if msg == self.WM_LBUTTONUP:
             if self._captured:
@@ -500,12 +538,13 @@ class NativeFloatButton:
 
         body = (8, 8, width - 8, 56)
         body_radius = 24
+        hovered = self._hovered and not self._captured
 
         if state == "recording":
-            shadow(body, body_radius, 16, 5, 3)
-            shadow(body, body_radius, 6, 8, 5)
-            rounded_gradient(body, body_radius, "#2a2a2a", "#101010")
-            draw.rounded_rectangle(box(body), radius=body_radius * scale, outline=rgba("#353535", 95), width=1 * scale)
+            shadow(body, body_radius, 20 if hovered else 16, 5, 3)
+            shadow(body, body_radius, 8 if hovered else 6, 8, 5)
+            rounded_gradient(body, body_radius, "#303030" if hovered else "#2a2a2a", "#121212")
+            draw.rounded_rectangle(box(body), radius=body_radius * scale, outline=rgba("#3f3f3f", 95), width=1 * scale)
             draw.rounded_rectangle(box((35, 26, 47, 38)), radius=3 * scale, fill=rgba("#ffffff", 246))
             text = _format_elapsed(self.elapsed)
             font = _float_font(20 * scale, bold=False)
@@ -515,9 +554,9 @@ class NativeFloatButton:
             text_y = int(text_center_y - (text_box[1] + text_box[3]) / 2)
             draw.text((text_x, text_y), text, font=font, fill=rgba("#ffffff", 244))
         else:
-            shadow(body, body_radius, 10, 5, 3)
-            shadow(body, body_radius, 4, 8, 5)
-            rounded_gradient(body, body_radius, "#ffffff", "#f4f4f1")
+            shadow(body, body_radius, 14 if hovered else 10, 5, 3)
+            shadow(body, body_radius, 5 if hovered else 4, 8, 5)
+            rounded_gradient(body, body_radius, "#ffffff", "#f7f7f4" if hovered else "#f4f4f1")
             center_x = width // 2
             center_y = (body[1] + body[3]) // 2
             if state == "processing":
@@ -530,9 +569,23 @@ class NativeFloatButton:
             elif state == "success":
                 draw.ellipse(box((center_x - 6, center_y - 6, center_x + 6, center_y + 6)), fill=rgba("#18c86f"))
             else:
-                draw.ellipse(box((center_x - 6, center_y - 6, center_x + 6, center_y + 6)), fill=rgba("#2f80ff"))
+                dot_radius = 7 if hovered else 6
+                dot_color = "#1f73ff" if hovered else "#2f80ff"
+                draw.ellipse(
+                    box((center_x - dot_radius, center_y - dot_radius, center_x + dot_radius, center_y + dot_radius)),
+                    fill=rgba(dot_color),
+                )
 
         return image.resize((width, height), Image.Resampling.LANCZOS)
+
+    def _track_mouse_leave(self, hwnd: int) -> None:
+        event = TRACKMOUSEEVENT()
+        event.cbSize = ctypes.sizeof(TRACKMOUSEEVENT)
+        event.dwFlags = self.TME_LEAVE
+        event.hwndTrack = hwnd
+        event.dwHoverTime = 0
+        if ctypes.windll.user32.TrackMouseEvent(ctypes.byref(event)):
+            self._tracking_mouse = True
 
     @staticmethod
     def _to_premultiplied_bgra(image: Image.Image) -> bytes:

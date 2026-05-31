@@ -35,7 +35,7 @@ def ensure_single_instance() -> None:
     user32 = ctypes.windll.user32
     _MUTEX_HANDLE = kernel32.CreateMutexW(None, True, "Local\\GolosovoyNaborSingleInstance")
     if kernel32.GetLastError() == 183:
-        user32.MessageBoxW(None, "Голосовой набор уже запущен возле часов.", APP_NAME, 0x40)
+        user32.MessageBoxW(None, "Глас уже запущен возле часов.", APP_NAME, 0x40)
         sys.exit(0)
 
 
@@ -120,7 +120,7 @@ class VoiceTypingApp:
         self._start_hotkey()
         self.root.after(150, self._drain_ui_queue)
         self.root.after(250, self._tick)
-        self._warm_up_transcriber()
+        self.root.after(800, self._warm_up_transcriber)
         self.root.mainloop()
 
     def _start_tray(self) -> None:
@@ -181,6 +181,8 @@ class VoiceTypingApp:
                 break
             if action == "toggle":
                 self.toggle_recording()
+            elif action == "float_menu":
+                self.show_float_menu()
             elif action == "settings":
                 self.show_settings()
             elif action == "history":
@@ -297,6 +299,29 @@ class VoiceTypingApp:
         self.float_feedback = ("success", time.monotonic() + 1.8)
         self._set_status(suffix + ".")
         self._show_status_window(auto_hide=True)
+
+    def show_float_menu(self) -> None:
+        menu = tk.Menu(
+            self.root,
+            tearoff=False,
+            borderwidth=0,
+            activeborderwidth=0,
+            relief="flat",
+        )
+        toggle_label = "Остановить" if self.is_recording else "Начать"
+        menu.add_command(label=toggle_label, command=self.toggle_recording)
+        menu.add_command(label="История", command=self.show_history)
+        menu.add_command(label="Настройки", command=self.show_settings)
+        menu.add_separator()
+        menu.add_command(label="Папка истории", command=self.open_history_folder)
+        menu.add_command(label="Скрыть кнопку", command=self.hide_floating_button)
+        menu.add_separator()
+        menu.add_command(label="Выход", command=self.quit)
+        x, y = self.root.winfo_pointerxy()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     def show_settings(self) -> None:
         if self.settings_window and self.settings_window.winfo_exists():
@@ -538,11 +563,18 @@ class VoiceTypingApp:
             if window and window.winfo_exists():
                 window.withdraw()
 
+    def hide_floating_button(self) -> None:
+        self.settings.show_status_window = False
+        save_settings(self.settings)
+        if self.status_window:
+            self.status_window.set_visible(False)
+        self._set_status("Кнопка скрыта.")
+
     def _build_status_window(self) -> None:
         x, y = self._default_float_position()
         self.status_window = NativeFloatButton(
             on_click=lambda: self._post("toggle"),
-            on_right_click=lambda: self._post("settings"),
+            on_right_click=lambda: self._post("float_menu"),
             on_moved=self._save_float_position,
         )
         self.status_window.start(x, y, visible=self.settings.show_status_window)

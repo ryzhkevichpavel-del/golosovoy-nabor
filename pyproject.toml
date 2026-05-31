@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "golosovoy-nabor"
-version = "0.1.4"
-description = "Free local Windows voice typing app powered by Faster Whisper."
+version = "0.1.5"
+description = "Glas: free local Windows voice typing app powered by Faster Whisper."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
