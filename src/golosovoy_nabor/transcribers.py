@@ -144,9 +144,17 @@ class FasterWhisperTranscriber:
             vad_choices = [duration >= 12.0, False] if duration is not None and duration >= 12.0 else [False]
             text = ""
             for vad_filter in dict.fromkeys(vad_choices):
-                text = self._transcribe_once(model, wav_path, language, vad_filter=vad_filter, beam_size=1)
+                try:
+                    text = self._transcribe_once(model, wav_path, language, vad_filter=vad_filter, beam_size=1)
+                except Exception:
+                    if vad_filter:
+                        continue
+                    raise
                 if language == "ru" and _latin_ratio(text) > 0.25:
-                    retry_text = self._transcribe_once(model, wav_path, language, vad_filter=vad_filter, beam_size=3)
+                    try:
+                        retry_text = self._transcribe_once(model, wav_path, language, vad_filter=vad_filter, beam_size=3)
+                    except Exception:
+                        retry_text = ""
                     if retry_text and _latin_ratio(retry_text) < _latin_ratio(text):
                         text = retry_text
                 if text:

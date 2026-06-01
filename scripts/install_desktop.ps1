@@ -27,7 +27,11 @@ foreach ($item in Get-ChildItem -LiteralPath $Here -Force) {
     if ($item.Name -in @("Install.bat", "Установить на рабочий стол.ps1")) {
         continue
     }
-    Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $InstallDir $item.Name) -Recurse -Force
+    $DestinationPath = Join-Path $InstallDir $item.Name
+    if (Test-Path $DestinationPath) {
+        Remove-Item -LiteralPath $DestinationPath -Recurse -Force
+    }
+    Copy-Item -LiteralPath $item.FullName -Destination $DestinationPath -Recurse -Force
 }
 if (!(Test-Path $Exe) -and (Test-Path $LegacyExe)) {
     Copy-Item -LiteralPath $LegacyExe -Destination $Exe -Force

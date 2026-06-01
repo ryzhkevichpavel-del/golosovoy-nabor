@@ -41,6 +41,7 @@ if (Test-Path $TargetDir) {
     --name $ProductName `
     --icon $iconPath `
     --paths "src" `
+    --collect-data "faster_whisper" `
     "launcher.py"
 
 $PackageDir = Join-Path $Root "dist\$PackageName"
